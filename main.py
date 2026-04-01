@@ -1,6 +1,8 @@
 import asyncio
+import base64
 import imaplib
 import email
+import re
 import time
 from email.header import decode_header
 
@@ -56,11 +58,20 @@ HELP_TEXT = (
 
 @register("astrbot_plugin_mail_alert", "Zhalslar", "邮箱未读邮件提醒插件", "1.0.0")
 class MailAlertPlugin(Star):
+    IMAP_TIMEOUT = 30
+    MAX_FETCH_COUNT = 20
+    CACHE_RETENTION_DAYS = 30
+    MAX_MAILBOXES_PER_USER = 10
+    MAX_MAILBOXES_TOTAL = 50
+    MAX_FILTER_VALUE_LENGTH = 200
+
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        self._last_check_time = None
+        self._last_check_ts = None
         self._cron_job = None
+        self._kv_lock = asyncio.Lock()
+        self._checking = False
 
     async def initialize(self):
         check_interval = self.config.get("check_interval", 5)
@@ -81,6 +92,34 @@ class MailAlertPlugin(Star):
 
     # ==================== 工具方法 ====================
 
+    def _encode_password(self, pwd: str) -> str:
+        return base64.b64encode(pwd.encode()).decode()
+
+    def _decode_password(self, encoded: str) -> str:
+        return base64.b64decode(encoded.encode()).decode()
+
+    def _is_valid_email(self, addr: str) -> bool:
+        if "@" not in addr:
+            return False
+        parts = addr.split("@")
+        if len(parts) != 2:
+            return False
+        local, domain = parts
+        if not local or not domain:
+            return False
+        if "." not in domain:
+            return False
+        return True
+
+    def _extract_email_from_header(self, from_header: str) -> str:
+        match = re.search(r'<([^>]+)>', from_header)
+        if match:
+            return match.group(1).strip()
+        match = re.search(r'[\w.\-+]+@[\w.\-]+', from_header)
+        if match:
+            return match.group(0).strip()
+        return from_header.strip()
+
     def _detect_imap_server(self, email_addr: str) -> str:
         domain = email_addr.split("@")[-1].lower()
         return IMAP_SERVERS.get(domain, "")
@@ -89,7 +128,7 @@ class MailAlertPlugin(Star):
         """验证IMAP连接，成功返回空字符串，失败返回错误信息。"""
         mail = None
         try:
-            mail = imaplib.IMAP4_SSL(imap_server, timeout=30)
+            mail = imaplib.IMAP4_SSL(imap_server, timeout=self.IMAP_TIMEOUT)
             mail.login(email_addr, password)
             return ""
         except Exception as e:
@@ -102,9 +141,9 @@ class MailAlertPlugin(Star):
                     pass
 
     def _mask_password(self, password: str) -> str:
-        if len(password) <= 6:
-            return "***"
-        return password[:3] + "***" + password[-3:]
+        if len(password) <= 4:
+            return "****"
+        return password[:2] + "****" + password[-1:]
 
     def _decode_header(self, header_str: str) -> str:
         if not header_str:
@@ -122,12 +161,13 @@ class MailAlertPlugin(Star):
         return "".join(result)
 
     def _match_filters(self, from_addr: str, subject: str, filters: list) -> bool:
-        from_addr_lower = from_addr.lower()
+        extracted_email = self._extract_email_from_header(from_addr).lower()
+        extracted_domain = extracted_email.split("@")[-1] if "@" in extracted_email else ""
         subject_lower = subject.lower()
         for f in filters:
-            if f["type"] == "domain" and f["value"].lower() in from_addr_lower:
+            if f["type"] == "domain" and f["value"].lower() == extracted_domain:
                 return True
-            if f["type"] == "address" and f["value"].lower() in from_addr_lower:
+            if f["type"] == "address" and f["value"].lower() == extracted_email:
                 return True
             if f["type"] == "subject" and f["value"].lower() in subject_lower:
                 return True
@@ -138,31 +178,38 @@ class MailAlertPlugin(Star):
         results = []
         mail = None
         try:
-            mail = imaplib.IMAP4_SSL(mailbox_config["imap_server"], timeout=30)
-            mail.login(mailbox_config["email"], mailbox_config["password"])
+            raw_password = self._decode_password(mailbox_config["password"])
+            mail = imaplib.IMAP4_SSL(mailbox_config["imap_server"], timeout=self.IMAP_TIMEOUT)
+            mail.login(mailbox_config["email"], raw_password)
             mail.select("INBOX", readonly=True)
             status, data = mail.uid('search', None, 'UNSEEN')
             if status != "OK":
                 return results
             mail_ids = data[0].split()
-            for mid in mail_ids[-20:]:
-                status, msg_data = mail.uid('fetch', mid, '(RFC822)')
-                if status != "OK":
-                    continue
-                msg = email.message_from_bytes(msg_data[0][1])
-                subject = self._decode_header(msg["Subject"])
-                from_addr = self._decode_header(msg["From"])
-                date_str = msg.get("Date", "")
-                uid = f"{mailbox_config['email']}:{mid.decode()}"
-                if mailbox_config.get("filters"):
-                    if not self._match_filters(from_addr, subject, mailbox_config["filters"]):
+            for mid in mail_ids[-self.MAX_FETCH_COUNT:]:
+                try:
+                    status, msg_data = mail.uid('fetch', mid, '(BODY.PEEK[HEADER.FIELDS (Subject From Date)])')
+                    if status != "OK":
                         continue
-                results.append({
-                    "uid": uid,
-                    "subject": subject,
-                    "from": from_addr,
-                    "date": date_str,
-                })
+                    if not msg_data or not msg_data[0] or not isinstance(msg_data[0], tuple) or len(msg_data[0]) < 2:
+                        continue
+                    msg = email.message_from_bytes(msg_data[0][1])
+                    subject = self._decode_header(msg["Subject"])
+                    from_addr = self._decode_header(msg["From"])
+                    date_str = msg.get("Date", "")
+                    uid = f"{mailbox_config['email']}:{mid.decode()}"
+                    if mailbox_config.get("filters"):
+                        if not self._match_filters(from_addr, subject, mailbox_config["filters"]):
+                            continue
+                    results.append({
+                        "uid": uid,
+                        "subject": subject,
+                        "from": from_addr,
+                        "date": date_str,
+                    })
+                except Exception as e:
+                    logger.warning(f"解析邮件 {mid} 失败: {e}")
+                    continue
         except Exception as e:
             logger.error(f"IMAP check failed for {mailbox_config['email']}: {e}")
         finally:
@@ -178,47 +225,56 @@ class MailAlertPlugin(Star):
         return await loop.run_in_executor(None, self._imap_fetch_unread, mailbox_config)
 
     async def _check_all_mailboxes(self):
-        mailboxes = await self.get_kv_data("mailboxes", [])
-        if not mailboxes:
+        if self._checking:
             return
-        notified_cache = await self.get_kv_data("notified_cache", {})
-        cooldown_hours = self.config.get("cooldown", 24)
-        now = time.time()
-        changed = False
-        for mb in mailboxes:
-            try:
-                new_mails = await self._check_mailbox(mb)
-            except Exception as e:
-                logger.error(f"检查邮箱 {mb['email']} 失败: {e}")
-                continue
-            for mail_info in new_mails:
-                uid = mail_info["uid"]
-                if uid in notified_cache and notified_cache[uid] + cooldown_hours * 3600 > now:
-                    continue
-                msg_text = (
-                    f"📬 新邮件提醒\n"
-                    f"邮箱: {mb['email']}\n"
-                    f"发件人: {mail_info['from']}\n"
-                    f"主题: {mail_info['subject']}\n"
-                    f"时间: {mail_info['date']}"
-                )
-                for session_str in mb.get("sessions", []):
-                    try:
-                        chain = MessageChain().message(msg_text)
-                        await self.context.send_message(session_str, chain)
-                    except Exception as e:
-                        logger.error(f"发送邮件通知到 {session_str} 失败: {e}")
-                notified_cache[uid] = now
-                changed = True
-        # 清理7天前的缓存
-        cutoff = now - 7 * 24 * 3600
-        old_keys = [k for k, v in notified_cache.items() if v < cutoff]
-        for k in old_keys:
-            del notified_cache[k]
-            changed = True
-        if changed:
-            await self.put_kv_data("notified_cache", notified_cache)
-        self._last_check_time = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._checking = True
+        try:
+            # 在锁内读取数据，然后立即释放锁
+            async with self._kv_lock:
+                mailboxes = await self.get_kv_data("mailboxes", [])
+            if not mailboxes:
+                return
+            # IMAP 操作在锁外执行，不阻塞用户命令
+            tasks = [self._check_mailbox(mb) for mb in mailboxes]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            # 重新获取锁，读取最新缓存并写回
+            async with self._kv_lock:
+                notified_cache = await self.get_kv_data("notified_cache", {})
+                now = time.time()
+                changed = False
+                for mb, result in zip(mailboxes, results):
+                    if isinstance(result, Exception):
+                        logger.error(f"检查邮箱 {mb['email']} 失败: {result}")
+                        continue
+                    for mail_info in result:
+                        uid = mail_info["uid"]
+                        if uid in notified_cache:
+                            continue
+                        msg_text = (
+                            f"📬 新邮件提醒\n"
+                            f"邮箱: {mb['email']}\n"
+                            f"发件人: {mail_info['from']}\n"
+                            f"主题: {mail_info['subject']}\n"
+                            f"时间: {mail_info['date']}"
+                        )
+                        for session_str in mb.get("sessions", []):
+                            try:
+                                chain = MessageChain().message(msg_text)
+                                await self.context.send_message(session_str, chain)
+                            except Exception as e:
+                                logger.error(f"发送邮件通知到 {session_str} 失败: {e}")
+                        notified_cache[uid] = now
+                        changed = True
+                cutoff = now - self.CACHE_RETENTION_DAYS * 24 * 3600
+                old_keys = [k for k, v in notified_cache.items() if v < cutoff]
+                for k in old_keys:
+                    del notified_cache[k]
+                    changed = True
+                if changed:
+                    await self.put_kv_data("notified_cache", notified_cache)
+            self._last_check_ts = time.time()
+        finally:
+            self._checking = False
 
     # ==================== 指令组 ====================
 
@@ -229,6 +285,10 @@ class MailAlertPlugin(Star):
     @mail_alert.command("add")
     async def add_mailbox(self, event: AstrMessageEvent, email_addr: str, password: str, imap_server: str = ""):
         """添加邮箱监控"""
+        yield event.plain_result("⚠️ 请尽快撤回上条包含授权码的消息。")
+        if not self._is_valid_email(email_addr):
+            yield event.plain_result("邮箱地址格式不正确，请检查后重试。")
+            return
         if not imap_server:
             imap_server = self._detect_imap_server(email_addr)
         if not imap_server:
@@ -237,44 +297,54 @@ class MailAlertPlugin(Star):
         loop = asyncio.get_running_loop()
         err = await loop.run_in_executor(None, self._verify_imap_connection, email_addr, password, imap_server)
         if err:
-            yield event.plain_result(f"IMAP连接验证失败: {err}")
+            logger.error(f"IMAP verification failed for {email_addr}: {err}")
+            yield event.plain_result("IMAP连接验证失败，请检查邮箱地址、授权码和IMAP服务器是否正确。")
             return
-        mailboxes = await self.get_kv_data("mailboxes", [])
-        for mb in mailboxes:
-            if mb["email"] == email_addr:
-                yield event.plain_result(f"邮箱 {email_addr} 已存在。")
+        async with self._kv_lock:
+            mailboxes = await self.get_kv_data("mailboxes", [])
+            sender_id = event.get_sender_id()
+            user_count = sum(1 for mb in mailboxes if mb["added_by"] == sender_id)
+            if user_count >= self.MAX_MAILBOXES_PER_USER:
+                yield event.plain_result(f"每个用户最多添加 {self.MAX_MAILBOXES_PER_USER} 个邮箱。")
                 return
-        sender_id = event.get_sender_id()
-        session_str = event.unified_msg_origin
-        mailboxes.append({
-            "email": email_addr,
-            "password": password,
-            "imap_server": imap_server,
-            "added_by": sender_id,
-            "sessions": [session_str],
-            "filters": [],
-        })
-        await self.put_kv_data("mailboxes", mailboxes)
+            if len(mailboxes) >= self.MAX_MAILBOXES_TOTAL:
+                yield event.plain_result(f"系统邮箱总数已达上限 {self.MAX_MAILBOXES_TOTAL}。")
+                return
+            for mb in mailboxes:
+                if mb["email"] == email_addr:
+                    yield event.plain_result(f"邮箱 {email_addr} 已存在。")
+                    return
+            session_str = event.unified_msg_origin
+            mailboxes.append({
+                "email": email_addr,
+                "password": self._encode_password(password),
+                "imap_server": imap_server,
+                "added_by": sender_id,
+                "sessions": [session_str],
+                "filters": [],
+            })
+            await self.put_kv_data("mailboxes", mailboxes)
         yield event.plain_result(f"邮箱 {email_addr} 添加成功，IMAP服务器: {imap_server}，已绑定当前会话。")
 
     @mail_alert.command("remove")
     async def remove_mailbox(self, event: AstrMessageEvent, email_addr: str):
         """移除邮箱监控"""
         sender_id = event.get_sender_id()
-        mailboxes = await self.get_kv_data("mailboxes", [])
-        found = False
-        for i, mb in enumerate(mailboxes):
-            if mb["email"] == email_addr:
-                if mb["added_by"] != sender_id:
-                    yield event.plain_result("只有添加者才能移除该邮箱。")
-                    return
-                mailboxes.pop(i)
-                found = True
-                break
-        if not found:
-            yield event.plain_result(f"未找到邮箱 {email_addr}。")
-            return
-        await self.put_kv_data("mailboxes", mailboxes)
+        async with self._kv_lock:
+            mailboxes = await self.get_kv_data("mailboxes", [])
+            found = False
+            for i, mb in enumerate(mailboxes):
+                if mb["email"] == email_addr:
+                    if mb["added_by"] != sender_id:
+                        yield event.plain_result("只有添加者才能移除该邮箱。")
+                        return
+                    mailboxes.pop(i)
+                    found = True
+                    break
+            if not found:
+                yield event.plain_result(f"未找到邮箱 {email_addr}。")
+                return
+            await self.put_kv_data("mailboxes", mailboxes)
         yield event.plain_result(f"邮箱 {email_addr} 已移除。")
 
     @mail_alert.command("list")
@@ -289,7 +359,7 @@ class MailAlertPlugin(Star):
         lines = []
         for idx, mb in enumerate(user_mailboxes, 1):
             lines.append(f"[{idx}] {mb['email']}")
-            lines.append(f"  授权码: {self._mask_password(mb['password'])}")
+            lines.append(f"  授权码: {self._mask_password(self._decode_password(mb['password']))}")
             lines.append(f"  IMAP: {mb['imap_server']}")
             sessions_str = ", ".join(mb.get("sessions", [])) or "无"
             lines.append(f"  绑定会话: {sessions_str}")
@@ -339,16 +409,17 @@ class MailAlertPlugin(Star):
         """绑定当前会话接收通知"""
         sender_id = event.get_sender_id()
         session_str = event.unified_msg_origin
-        mailboxes = await self.get_kv_data("mailboxes", [])
-        for mb in mailboxes:
-            if mb["email"] == email_addr and mb["added_by"] == sender_id:
-                if session_str in mb.get("sessions", []):
-                    yield event.plain_result("当前会话已绑定该邮箱。")
+        async with self._kv_lock:
+            mailboxes = await self.get_kv_data("mailboxes", [])
+            for mb in mailboxes:
+                if mb["email"] == email_addr and mb["added_by"] == sender_id:
+                    if session_str in mb.get("sessions", []):
+                        yield event.plain_result("当前会话已绑定该邮箱。")
+                        return
+                    mb.setdefault("sessions", []).append(session_str)
+                    await self.put_kv_data("mailboxes", mailboxes)
+                    yield event.plain_result(f"已绑定当前会话到邮箱 {email_addr}。")
                     return
-                mb.setdefault("sessions", []).append(session_str)
-                await self.put_kv_data("mailboxes", mailboxes)
-                yield event.plain_result(f"已绑定当前会话到邮箱 {email_addr}。")
-                return
         yield event.plain_result(f"未找到你添加的邮箱 {email_addr}。")
 
     @mail_alert.command("unbind")
@@ -356,17 +427,18 @@ class MailAlertPlugin(Star):
         """解绑当前会话"""
         sender_id = event.get_sender_id()
         session_str = event.unified_msg_origin
-        mailboxes = await self.get_kv_data("mailboxes", [])
-        for mb in mailboxes:
-            if mb["email"] == email_addr and mb["added_by"] == sender_id:
-                sessions = mb.get("sessions", [])
-                if session_str not in sessions:
-                    yield event.plain_result("当前会话未绑定该邮箱。")
+        async with self._kv_lock:
+            mailboxes = await self.get_kv_data("mailboxes", [])
+            for mb in mailboxes:
+                if mb["email"] == email_addr and mb["added_by"] == sender_id:
+                    sessions = mb.get("sessions", [])
+                    if session_str not in sessions:
+                        yield event.plain_result("当前会话未绑定该邮箱。")
+                        return
+                    sessions.remove(session_str)
+                    await self.put_kv_data("mailboxes", mailboxes)
+                    yield event.plain_result(f"已解绑当前会话与邮箱 {email_addr}。")
                     return
-                sessions.remove(session_str)
-                await self.put_kv_data("mailboxes", mailboxes)
-                yield event.plain_result(f"已解绑当前会话与邮箱 {email_addr}。")
-                return
         yield event.plain_result(f"未找到你添加的邮箱 {email_addr}。")
 
     # ==================== filter 子指令组 ====================
@@ -381,37 +453,42 @@ class MailAlertPlugin(Star):
         if filter_type not in ("domain", "address", "subject"):
             yield event.plain_result("过滤类型必须是 domain、address 或 subject。")
             return
+        if len(value) > self.MAX_FILTER_VALUE_LENGTH:
+            yield event.plain_result(f"过滤值长度不能超过 {self.MAX_FILTER_VALUE_LENGTH} 个字符。")
+            return
         sender_id = event.get_sender_id()
-        mailboxes = await self.get_kv_data("mailboxes", [])
-        for mb in mailboxes:
-            if mb["email"] == email_addr and mb["added_by"] == sender_id:
-                filters = mb.setdefault("filters", [])
-                for f in filters:
-                    if f["type"] == filter_type and f["value"] == value:
-                        yield event.plain_result("该过滤规则已存在。")
-                        return
-                filters.append({"type": filter_type, "value": value})
-                await self.put_kv_data("mailboxes", mailboxes)
-                yield event.plain_result(f"已添加过滤规则: {filter_type}:{value}")
-                return
+        async with self._kv_lock:
+            mailboxes = await self.get_kv_data("mailboxes", [])
+            for mb in mailboxes:
+                if mb["email"] == email_addr and mb["added_by"] == sender_id:
+                    filters = mb.setdefault("filters", [])
+                    for f in filters:
+                        if f["type"] == filter_type and f["value"] == value:
+                            yield event.plain_result("该过滤规则已存在。")
+                            return
+                    filters.append({"type": filter_type, "value": value})
+                    await self.put_kv_data("mailboxes", mailboxes)
+                    yield event.plain_result(f"已添加过滤规则: {filter_type}:{value}")
+                    return
         yield event.plain_result(f"未找到你添加的邮箱 {email_addr}。")
 
     @mail_filter.command("remove")
     async def filter_remove(self, event: AstrMessageEvent, email_addr: str, filter_type: str, value: str):
         """移除白名单过滤规则"""
         sender_id = event.get_sender_id()
-        mailboxes = await self.get_kv_data("mailboxes", [])
-        for mb in mailboxes:
-            if mb["email"] == email_addr and mb["added_by"] == sender_id:
-                filters = mb.get("filters", [])
-                for i, f in enumerate(filters):
-                    if f["type"] == filter_type and f["value"] == value:
-                        filters.pop(i)
-                        await self.put_kv_data("mailboxes", mailboxes)
-                        yield event.plain_result(f"已移除过滤规则: {filter_type}:{value}")
-                        return
-                yield event.plain_result("未找到该过滤规则。")
-                return
+        async with self._kv_lock:
+            mailboxes = await self.get_kv_data("mailboxes", [])
+            for mb in mailboxes:
+                if mb["email"] == email_addr and mb["added_by"] == sender_id:
+                    filters = mb.get("filters", [])
+                    for i, f in enumerate(filters):
+                        if f["type"] == filter_type and f["value"] == value:
+                            filters.pop(i)
+                            await self.put_kv_data("mailboxes", mailboxes)
+                            yield event.plain_result(f"已移除过滤规则: {filter_type}:{value}")
+                            return
+                    yield event.plain_result("未找到该过滤规则。")
+                    return
         yield event.plain_result(f"未找到你添加的邮箱 {email_addr}。")
 
     @mail_filter.command("list")
@@ -439,7 +516,10 @@ class MailAlertPlugin(Star):
         """查看监控状态"""
         mailboxes = await self.get_kv_data("mailboxes", [])
         check_interval = self.config.get("check_interval", 5)
-        last_check = self._last_check_time or "尚未执行"
+        if self._last_check_ts:
+            last_check = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._last_check_ts))
+        else:
+            last_check = "尚未执行"
         lines = [
             "邮件提醒插件状态",
             f"监控邮箱数: {len(mailboxes)}",
