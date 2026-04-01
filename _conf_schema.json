@@ -1,0 +1,14 @@
+{
+  "check_interval": {
+    "type": "int",
+    "description": "邮件检查间隔（分钟）",
+    "hint": "定时检查未读邮件的时间间隔，单位为分钟，最小值为1",
+    "default": 5
+  },
+  "cooldown": {
+    "type": "int",
+    "description": "同一邮件提醒冷却时间（小时）",
+    "hint": "对同一封邮件的重复提醒冷却时间，避免重复通知",
+    "default": 24
+  }
+}
