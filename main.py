@@ -4,10 +4,9 @@ import email
 import time
 from email.header import decode_header
 
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
-from astrbot.core.message.message_event_result import MessageChain
 
 IMAP_SERVERS = {
     "qq.com": "imap.qq.com",
@@ -88,13 +87,19 @@ class MailAlertPlugin(Star):
 
     def _verify_imap_connection(self, email_addr: str, password: str, imap_server: str) -> str:
         """验证IMAP连接，成功返回空字符串，失败返回错误信息。"""
+        mail = None
         try:
-            mail = imaplib.IMAP4_SSL(imap_server)
+            mail = imaplib.IMAP4_SSL(imap_server, timeout=30)
             mail.login(email_addr, password)
-            mail.logout()
             return ""
         except Exception as e:
             return str(e)
+        finally:
+            if mail:
+                try:
+                    mail.logout()
+                except Exception:
+                    pass
 
     def _mask_password(self, password: str) -> str:
         if len(password) <= 6:
@@ -108,7 +113,10 @@ class MailAlertPlugin(Star):
         result = []
         for part, charset in decoded_parts:
             if isinstance(part, bytes):
-                result.append(part.decode(charset or "utf-8", errors="replace"))
+                try:
+                    result.append(part.decode(charset or "utf-8", errors="replace"))
+                except (LookupError, UnicodeDecodeError):
+                    result.append(part.decode("utf-8", errors="replace"))
             else:
                 result.append(part)
         return "".join(result)
@@ -128,17 +136,17 @@ class MailAlertPlugin(Star):
     def _imap_fetch_unread(self, mailbox_config: dict) -> list:
         """阻塞式IMAP获取未读邮件，在线程执行器中运行。"""
         results = []
+        mail = None
         try:
-            mail = imaplib.IMAP4_SSL(mailbox_config["imap_server"])
+            mail = imaplib.IMAP4_SSL(mailbox_config["imap_server"], timeout=30)
             mail.login(mailbox_config["email"], mailbox_config["password"])
             mail.select("INBOX", readonly=True)
-            status, data = mail.search(None, "UNSEEN")
+            status, data = mail.uid('search', None, 'UNSEEN')
             if status != "OK":
-                mail.logout()
                 return results
             mail_ids = data[0].split()
             for mid in mail_ids[-20:]:
-                status, msg_data = mail.fetch(mid, "(RFC822)")
+                status, msg_data = mail.uid('fetch', mid, '(RFC822)')
                 if status != "OK":
                     continue
                 msg = email.message_from_bytes(msg_data[0][1])
@@ -155,13 +163,18 @@ class MailAlertPlugin(Star):
                     "from": from_addr,
                     "date": date_str,
                 })
-            mail.logout()
         except Exception as e:
             logger.error(f"IMAP check failed for {mailbox_config['email']}: {e}")
+        finally:
+            if mail:
+                try:
+                    mail.logout()
+                except Exception:
+                    pass
         return results
 
     async def _check_mailbox(self, mailbox_config: dict) -> list:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._imap_fetch_unread, mailbox_config)
 
     async def _check_all_mailboxes(self):
@@ -221,7 +234,7 @@ class MailAlertPlugin(Star):
         if not imap_server:
             yield event.plain_result(f"无法自动检测 {email_addr} 的IMAP服务器，请手动指定。")
             return
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         err = await loop.run_in_executor(None, self._verify_imap_connection, email_addr, password, imap_server)
         if err:
             yield event.plain_result(f"IMAP连接验证失败: {err}")
