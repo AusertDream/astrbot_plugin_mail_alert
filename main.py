@@ -3,6 +3,7 @@ import base64
 import imaplib
 import email
 import ipaddress
+import json
 import re
 import ssl
 import time
@@ -12,11 +13,71 @@ from urllib.parse import urlparse
 import os
 import shutil
 
+
+class ProxyIMAP4SSL(imaplib.IMAP4_SSL):
+    def __init__(self, host: str, timeout: int | None, proxy_info):
+        self.proxy_info = proxy_info
+        super().__init__(host=host, timeout=timeout)
+
+    def _create_socket(self, timeout):
+        proxy_type, proxy_host, proxy_port = self.proxy_info
+        return socks.create_connection(
+            (self.host, getattr(self, "port", imaplib.IMAP4_SSL_PORT)),
+            timeout=timeout,
+            proxy_type=proxy_type,
+            proxy_addr=proxy_host,
+            proxy_port=proxy_port,
+        )
+
+
+def _merge_missing_schema_keys(local_value, template_value):
+    if isinstance(local_value, dict) and isinstance(template_value, dict):
+        merged = dict(local_value)
+        for key, value in template_value.items():
+            if key in merged:
+                merged[key] = _merge_missing_schema_keys(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+    return local_value
+
+
+def ensure_schema_file(local_path: str, template_path: str):
+    if not os.path.exists(template_path):
+        return
+    try:
+        with open(template_path, "r", encoding="utf-8") as f:
+            template_data = json.load(f)
+    except Exception as e:
+        logger.warning(f"加载配置模板失败: {e}")
+        return
+    if not os.path.exists(local_path):
+        try:
+            shutil.copy2(template_path, local_path)
+            return
+        except Exception as e:
+            logger.warning(f"复制配置模板失败: {e}")
+            return
+    try:
+        with open(local_path, "r", encoding="utf-8") as f:
+            local_data = json.load(f)
+    except Exception as e:
+        logger.warning(f"读取本地配置 schema 失败: {e}")
+        return
+    merged_data = _merge_missing_schema_keys(local_data, template_data)
+    if merged_data == local_data:
+        return
+    try:
+        with open(local_path, "w", encoding="utf-8") as f:
+            json.dump(merged_data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+    except Exception as e:
+        logger.warning(f"写回本地配置 schema 失败: {e}")
+
+
 _plugin_dir = os.path.dirname(os.path.abspath(__file__))
 _schema_local = os.path.join(_plugin_dir, "_conf_schema.json")
 _schema_template = os.path.join(_plugin_dir, "_conf_schema.template.json")
-if not os.path.exists(_schema_local) and os.path.exists(_schema_template):
-    shutil.copy2(_schema_template, _schema_local)
 
 try:
     import socks
@@ -27,6 +88,8 @@ except ImportError:
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
+
+ensure_schema_file(_schema_local, _schema_template)
 
 IMAP_SERVERS = {
     "qq.com": "imap.qq.com",
@@ -204,22 +267,7 @@ class MailAlertPlugin(Star):
         if proxy_url and HAS_PYSOCKS and imap_server in FOREIGN_IMAP_SERVERS:
             proxy_info = self._parse_proxy_url(proxy_url)
             if proxy_info:
-                proxy_type, proxy_host, proxy_port = proxy_info
-                sock = socks.create_connection(
-                    (imap_server, 993),
-                    timeout=timeout,
-                    proxy_type=proxy_type,
-                    proxy_addr=proxy_host,
-                    proxy_port=proxy_port,
-                )
-                ssl_context = ssl.create_default_context()
-                ssl_sock = ssl_context.wrap_socket(sock, server_hostname=imap_server)
-                mail = imaplib.IMAP4_SSL(host=imap_server, ssl_context=ssl_context)
-                mail.sock = ssl_sock
-                mail.file = mail.sock.makefile('rb')
-                # 读取服务器问候语
-                mail._get_response()
-                return mail
+                return ProxyIMAP4SSL(host=imap_server, timeout=timeout, proxy_info=proxy_info)
         return imaplib.IMAP4_SSL(imap_server, timeout=timeout)
 
     def _extract_email_from_header(self, from_header: str) -> str:
@@ -235,15 +283,29 @@ class MailAlertPlugin(Star):
         domain = email_addr.split("@")[-1].lower()
         return IMAP_SERVERS.get(domain, "")
 
+    def _build_user_visible_connection_error(self) -> str:
+        return "IMAP连接失败，请检查邮箱地址、授权码和IMAP服务器后重试。"
+
+    def _build_user_visible_check_error(self, email_addr: str) -> str:
+        return f"邮箱 {email_addr} 检查失败，请稍后重试或重新检查邮箱配置。"
+
+    def _is_domain_match(self, filter_domain: str, extracted_domain: str) -> bool:
+        filter_domain = filter_domain.strip().lower()
+        extracted_domain = extracted_domain.strip().lower()
+        if not filter_domain or not extracted_domain:
+            return False
+        return extracted_domain == filter_domain or extracted_domain.endswith(f".{filter_domain}")
+
     def _verify_imap_connection(self, email_addr: str, password: str, imap_server: str) -> str:
-        """验证IMAP连接，成功返回空字符串，失败返回错误信息。"""
+        """验证IMAP连接，成功返回空字符串，失败返回受控错误信息。"""
         mail = None
         try:
             mail = self._create_imap_connection(imap_server, self.IMAP_TIMEOUT)
             mail.login(email_addr, password)
             return ""
         except Exception as e:
-            return str(e)
+            logger.error(f"IMAP verification failed for {email_addr}: {e}")
+            return self._build_user_visible_connection_error()
         finally:
             if mail:
                 try:
@@ -276,7 +338,7 @@ class MailAlertPlugin(Star):
         extracted_domain = extracted_email.split("@")[-1] if "@" in extracted_email else ""
         subject_lower = subject.lower()
         for f in filters:
-            if f["type"] == "domain" and f["value"].lower() in extracted_domain:
+            if f["type"] == "domain" and self._is_domain_match(f["value"], extracted_domain):
                 return True
             if f["type"] == "address" and f["value"].lower() == extracted_email:
                 return True
@@ -428,8 +490,7 @@ class MailAlertPlugin(Star):
         loop = asyncio.get_running_loop()
         err = await loop.run_in_executor(None, self._verify_imap_connection, email_addr, password, imap_server)
         if err:
-            logger.error(f"IMAP verification failed for {email_addr}: {err}")
-            yield event.plain_result(f"IMAP连接验证失败: {err}\n请检查邮箱地址、授权码和IMAP服务器是否正确。")
+            yield event.plain_result(err)
             return
         async with self._kv_lock:
             mailboxes = await self.get_kv_data("mailboxes", [])
@@ -531,7 +592,8 @@ class MailAlertPlugin(Star):
                         f"时间: {m['date']}"
                     )
             except Exception as e:
-                all_results.append(f"邮箱 {mb['email']} 检查失败: {e}")
+                logger.error(f"手动检查邮箱 {mb['email']} 失败: {e}")
+                all_results.append(self._build_user_visible_check_error(mb["email"]))
         if all_uids:
             async with self._kv_lock:
                 notified_cache = await self.get_kv_data("notified_cache", {})
