@@ -324,6 +324,7 @@ class MailAlertPlugin(Star):
                     continue
         except Exception as e:
             logger.error(f"IMAP check failed for {mailbox_config['email']}: {e}")
+            raise
         finally:
             if mail:
                 try:
