@@ -9,6 +9,15 @@ import time
 from email.header import decode_header
 from urllib.parse import urlparse
 
+import os
+import shutil
+
+_plugin_dir = os.path.dirname(os.path.abspath(__file__))
+_schema_local = os.path.join(_plugin_dir, "_conf_schema.json")
+_schema_template = os.path.join(_plugin_dir, "_conf_schema.template.json")
+if not os.path.exists(_schema_local) and os.path.exists(_schema_template):
+    shutil.copy2(_schema_template, _schema_local)
+
 try:
     import socks
     HAS_PYSOCKS = True
@@ -70,7 +79,7 @@ HELP_TEXT = (
 )
 
 
-@register("astrbot_plugin_mail_alert", "Zhalslar", "邮箱未读邮件提醒插件", "1.0.1")
+@register("astrbot_plugin_mail_alert", "Zhalslar", "邮箱未读邮件提醒插件", "1.0.2")
 class MailAlertPlugin(Star):
     IMAP_TIMEOUT = 30
     MAX_FETCH_COUNT = 20
@@ -100,6 +109,32 @@ class MailAlertPlugin(Star):
             description="定时检查邮箱未读邮件",
         )
         logger.info(f"邮件提醒插件已启动，检查间隔: {check_interval} 分钟")
+        await self._test_proxy_connectivity()
+
+    async def _test_proxy_connectivity(self):
+        """测试代理连接可达性，结果输出到控制台日志。"""
+        proxy_url = self.config.get("imap_proxy", "")
+        if not proxy_url:
+            logger.info("未配置IMAP代理。")
+            return
+        if not HAS_PYSOCKS:
+            logger.warning(f"已配置IMAP代理 {proxy_url}，但未安装PySocks库，代理将不会生效。")
+            return
+        proxy_info = self._parse_proxy_url(proxy_url)
+        if not proxy_info:
+            logger.warning(f"IMAP代理地址格式无效: {proxy_url}")
+            return
+        proxy_type, proxy_host, proxy_port = proxy_info
+        loop = asyncio.get_running_loop()
+        try:
+            import socket
+            def _test_connection():
+                sock = socket.create_connection((proxy_host, proxy_port), timeout=10)
+                sock.close()
+            await loop.run_in_executor(None, _test_connection)
+            logger.info(f"IMAP代理连接测试成功: {proxy_url}")
+        except Exception as e:
+            logger.warning(f"IMAP代理连接测试失败: {proxy_url}，错误: {e}")
 
     async def terminate(self):
         if hasattr(self, "_cron_job") and self._cron_job:
@@ -372,6 +407,7 @@ class MailAlertPlugin(Star):
     @mail_alert.command("add")
     async def add_mailbox(self, event: AstrMessageEvent, email_addr: str, password: str, imap_server: str = ""):
         """添加邮箱监控"""
+        yield event.plain_result("收到指令，正在处理中...")
         yield event.plain_result("⚠️ 请尽快撤回上条包含授权码的消息。")
         if email_addr.lower().endswith("@gmail.com"):
             yield event.plain_result("提示: Gmail授权码自带空格（格式: XXXX XXXX XXXX XXXX），请确保已删除所有空格后再输入，否则会导致指令识别失败。")
@@ -387,11 +423,12 @@ class MailAlertPlugin(Star):
             if not self._is_safe_hostname(imap_server):
                 yield event.plain_result("IMAP服务器地址不合法，请使用有效的域名。")
                 return
+        yield event.plain_result("正在测试IMAP连接，请稍候...")
         loop = asyncio.get_running_loop()
         err = await loop.run_in_executor(None, self._verify_imap_connection, email_addr, password, imap_server)
         if err:
             logger.error(f"IMAP verification failed for {email_addr}: {err}")
-            yield event.plain_result("IMAP连接验证失败，请检查邮箱地址、授权码和IMAP服务器是否正确。")
+            yield event.plain_result(f"IMAP连接验证失败: {err}\n请检查邮箱地址、授权码和IMAP服务器是否正确。")
             return
         async with self._kv_lock:
             mailboxes = await self.get_kv_data("mailboxes", [])
@@ -466,6 +503,7 @@ class MailAlertPlugin(Star):
     @mail_alert.command("check")
     async def check_mailbox(self, event: AstrMessageEvent, email_addr: str = ""):
         """手动检查未读邮件"""
+        yield event.plain_result("收到指令，正在检查邮箱...")
         sender_id = event.get_sender_id()
         mailboxes = await self.get_kv_data("mailboxes", [])
         if email_addr:
