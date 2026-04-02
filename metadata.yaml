@@ -1,6 +1,6 @@
 name: astrbot_plugin_mail_alert
 display_name: 邮件提醒
 desc: 通过 IMAP 协议监控邮箱长时间未读邮件，支持白名单过滤和多会话推送提醒。
-version: v1.0.0
+version: v1.0.1
 author: AusertDream
 repo: https://github.com/AusertDream/astrbot_plugin_mail_alert

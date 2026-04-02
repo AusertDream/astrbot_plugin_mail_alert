@@ -4,8 +4,16 @@ import imaplib
 import email
 import ipaddress
 import re
+import ssl
 import time
 from email.header import decode_header
+from urllib.parse import urlparse
+
+try:
+    import socks
+    HAS_PYSOCKS = True
+except ImportError:
+    HAS_PYSOCKS = False
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
@@ -30,34 +38,39 @@ IMAP_SERVERS = {
     "189.cn": "imap.189.cn",
 }
 
+FOREIGN_IMAP_SERVERS = {
+    "imap.gmail.com",
+    "imap-mail.outlook.com",
+}
+
 HELP_TEXT = (
     "邮件提醒插件 - 命令列表\n\n"
-    "mail_alert add <邮箱> <授权码> [IMAP服务器]\n"
+    "/mail_alert add <邮箱> <授权码> [IMAP服务器]\n"
     "  添加邮箱监控，自动检测IMAP服务器，验证连接后保存，自动绑定当前会话\n\n"
-    "mail_alert remove <邮箱>\n"
+    "/mail_alert remove <邮箱>\n"
     "  移除邮箱监控（仅添加者可操作）\n\n"
-    "mail_alert list\n"
+    "/mail_alert list\n"
     "  列出当前用户已添加的所有邮箱\n\n"
-    "mail_alert check [邮箱]\n"
+    "/mail_alert check [邮箱]\n"
     "  手动触发检查未读邮件\n\n"
-    "mail_alert bind <邮箱>\n"
+    "/mail_alert bind <邮箱>\n"
     "  绑定当前会话接收该邮箱的通知\n\n"
-    "mail_alert unbind <邮箱>\n"
+    "/mail_alert unbind <邮箱>\n"
     "  解绑当前会话\n\n"
-    "mail_alert filter add <邮箱> <类型> <值>\n"
+    "/mail_alert filter add <邮箱> <类型> <值>\n"
     "  添加白名单过滤规则（类型: domain/address/subject）\n\n"
-    "mail_alert filter remove <邮箱> <类型> <值>\n"
+    "/mail_alert filter remove <邮箱> <类型> <值>\n"
     "  移除白名单过滤规则\n\n"
-    "mail_alert filter list <邮箱>\n"
+    "/mail_alert filter list <邮箱>\n"
     "  查看邮箱的过滤规则\n\n"
-    "mail_alert status\n"
+    "/mail_alert status\n"
     "  查看监控状态\n\n"
-    "mail_alert help\n"
+    "/mail_alert help\n"
     "  显示本帮助信息"
 )
 
 
-@register("astrbot_plugin_mail_alert", "Zhalslar", "邮箱未读邮件提醒插件", "1.0.0")
+@register("astrbot_plugin_mail_alert", "Zhalslar", "邮箱未读邮件提醒插件", "1.0.1")
 class MailAlertPlugin(Star):
     IMAP_TIMEOUT = 30
     MAX_FETCH_COUNT = 20
@@ -129,6 +142,51 @@ class MailAlertPlugin(Star):
             return False
         return True
 
+    def _parse_proxy_url(self, proxy_url: str):
+        """解析代理URL，返回 (proxy_type, host, port) 或 None。"""
+        try:
+            parsed = urlparse(proxy_url)
+            scheme = parsed.scheme.lower()
+            host = parsed.hostname
+            port = parsed.port
+            if not host or not port:
+                return None
+            if scheme == "socks5":
+                proxy_type = socks.SOCKS5
+            elif scheme == "socks4":
+                proxy_type = socks.SOCKS4
+            elif scheme in ("http", "https"):
+                proxy_type = socks.HTTP
+            else:
+                return None
+            return (proxy_type, host, port)
+        except Exception:
+            return None
+
+    def _create_imap_connection(self, imap_server: str, timeout: int):
+        """创建IMAP连接，对国外服务器自动使用代理。"""
+        proxy_url = self.config.get("imap_proxy", "")
+        if proxy_url and HAS_PYSOCKS and imap_server in FOREIGN_IMAP_SERVERS:
+            proxy_info = self._parse_proxy_url(proxy_url)
+            if proxy_info:
+                proxy_type, proxy_host, proxy_port = proxy_info
+                sock = socks.create_connection(
+                    (imap_server, 993),
+                    timeout=timeout,
+                    proxy_type=proxy_type,
+                    proxy_addr=proxy_host,
+                    proxy_port=proxy_port,
+                )
+                ssl_context = ssl.create_default_context()
+                ssl_sock = ssl_context.wrap_socket(sock, server_hostname=imap_server)
+                mail = imaplib.IMAP4_SSL(host=imap_server, ssl_context=ssl_context)
+                mail.sock = ssl_sock
+                mail.file = mail.sock.makefile('rb')
+                # 读取服务器问候语
+                mail._get_response()
+                return mail
+        return imaplib.IMAP4_SSL(imap_server, timeout=timeout)
+
     def _extract_email_from_header(self, from_header: str) -> str:
         match = re.search(r'<([^>]+)>', from_header)
         if match:
@@ -146,7 +204,7 @@ class MailAlertPlugin(Star):
         """验证IMAP连接，成功返回空字符串，失败返回错误信息。"""
         mail = None
         try:
-            mail = imaplib.IMAP4_SSL(imap_server, timeout=self.IMAP_TIMEOUT)
+            mail = self._create_imap_connection(imap_server, self.IMAP_TIMEOUT)
             mail.login(email_addr, password)
             return ""
         except Exception as e:
@@ -183,7 +241,7 @@ class MailAlertPlugin(Star):
         extracted_domain = extracted_email.split("@")[-1] if "@" in extracted_email else ""
         subject_lower = subject.lower()
         for f in filters:
-            if f["type"] == "domain" and f["value"].lower() == extracted_domain:
+            if f["type"] == "domain" and f["value"].lower() in extracted_domain:
                 return True
             if f["type"] == "address" and f["value"].lower() == extracted_email:
                 return True
@@ -197,7 +255,7 @@ class MailAlertPlugin(Star):
         mail = None
         try:
             raw_password = self._decode_password(mailbox_config["password"])
-            mail = imaplib.IMAP4_SSL(mailbox_config["imap_server"], timeout=self.IMAP_TIMEOUT)
+            mail = self._create_imap_connection(mailbox_config["imap_server"], self.IMAP_TIMEOUT)
             mail.login(mailbox_config["email"], raw_password)
             status, select_data = mail.select("INBOX", readonly=True)
             uidvalidity = select_data[0].decode() if select_data and select_data[0] else "0"
@@ -315,6 +373,8 @@ class MailAlertPlugin(Star):
     async def add_mailbox(self, event: AstrMessageEvent, email_addr: str, password: str, imap_server: str = ""):
         """添加邮箱监控"""
         yield event.plain_result("⚠️ 请尽快撤回上条包含授权码的消息。")
+        if email_addr.lower().endswith("@gmail.com"):
+            yield event.plain_result("提示: Gmail授权码自带空格（格式: XXXX XXXX XXXX XXXX），请确保已删除所有空格后再输入，否则会导致指令识别失败。")
         if not self._is_valid_email(email_addr):
             yield event.plain_result("邮箱地址格式不正确，请检查后重试。")
             return

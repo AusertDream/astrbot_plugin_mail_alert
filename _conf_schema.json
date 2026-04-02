@@ -10,5 +10,11 @@
     "description": "同一邮件提醒冷却时间（小时）",
     "hint": "对同一封邮件的重复提醒冷却时间，避免重复通知",
     "default": 24
+  },
+  "imap_proxy": {
+    "type": "str",
+    "description": "IMAP代理地址（仅用于国外邮箱服务器）",
+    "hint": "用于访问Gmail、Outlook等国外IMAP服务器的代理地址，格式: socks5://host:port 或 http://host:port，留空则不使用代理。需安装PySocks库。",
+    "default": ""
   }
 }
