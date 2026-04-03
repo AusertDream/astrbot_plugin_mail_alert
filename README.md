@@ -1,6 +1,8 @@
-# astrbot_plugin_mail_alert
+# 邮件提醒插件
 
-AstrBot 邮箱未读邮件提醒插件。通过 IMAP 协议定时检查邮箱未读邮件，支持白名单过滤规则和多会话推送，适用于 QQ、Telegram 等平台接收邮件通知。
+AstrBot 邮箱长时间未读邮件提醒插件。通过 IMAP 协议定时检查邮箱长时间未读的邮件，支持白名单过滤规则和多会话推送，目前只测试了napcat，其他平台接入器没有做测试，不保证可用性。默认的情况下，一小时最多通知一次。
+
+~~这下再也不会错过导师的邮件了~~
 
 ## 功能
 
@@ -35,19 +37,19 @@ AstrBot 邮箱未读邮件提醒插件。通过 IMAP 协议定时检查邮箱未
 
 ## 命令列表
 
-| 命令 | 说明 |
-|------|------|
-| `mail_alert add <邮箱> <授权码> [IMAP服务器]` | 添加邮箱监控 |
-| `mail_alert remove <邮箱>` | 移除邮箱（仅添加者） |
-| `mail_alert list` | 列出已添加的邮箱 |
-| `mail_alert check [邮箱]` | 手动检查未读邮件 |
-| `mail_alert bind <邮箱>` | 绑定当前会话接收通知 |
-| `mail_alert unbind <邮箱>` | 解绑当前会话 |
-| `mail_alert filter add <邮箱> <类型> <值>` | 添加白名单规则 |
-| `mail_alert filter remove <邮箱> <类型> <值>` | 移除白名单规则 |
-| `mail_alert filter list <邮箱>` | 查看过滤规则 |
-| `mail_alert status` | 查看监控状态 |
-| `mail_alert help` | 显示帮助信息 |
+| 命令                                       | 说明         |
+| ---------------------------------------- | ---------- |
+| `mail_alert add <邮箱> <授权码> [IMAP服务器]`    | 添加邮箱监控     |
+| `mail_alert remove <邮箱>`                 | 移除邮箱（仅添加者） |
+| `mail_alert list`                        | 列出已添加的邮箱   |
+| `mail_alert check [邮箱]`                  | 手动检查未读邮件   |
+| `mail_alert bind <邮箱>`                   | 绑定当前会话接收通知 |
+| `mail_alert unbind <邮箱>`                 | 解绑当前会话     |
+| `mail_alert filter add <邮箱> <类型> <值>`    | 添加白名单规则    |
+| `mail_alert filter remove <邮箱> <类型> <值>` | 移除白名单规则    |
+| `mail_alert filter list <邮箱>`            | 查看过滤规则     |
+| `mail_alert status`                      | 查看监控状态     |
+| `mail_alert help`                        | 显示帮助信息     |
 
 过滤类型支持 `domain`（发件人域名）、`address`（发件人地址）、`subject`（邮件主题关键词）。设置过滤规则后，只有匹配至少一条规则的邮件才会触发通知。未设置规则时所有未读邮件都会通知。
 
