@@ -32,6 +32,12 @@ class ProxyIMAP4SSL(imaplib.IMAP4_SSL):
 
 def _merge_missing_schema_keys(local_value, template_value):
     if isinstance(local_value, dict) and isinstance(template_value, dict):
+        if all(not isinstance(value, dict) for value in template_value.values()):
+            merged = dict(local_value)
+            for key, value in template_value.items():
+                if key not in merged or merged[key] != value:
+                    merged[key] = value
+            return merged
         merged = dict(local_value)
         for key, value in template_value.items():
             if key in merged:
