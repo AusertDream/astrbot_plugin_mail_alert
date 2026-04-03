@@ -3,15 +3,11 @@ import base64
 import imaplib
 import email
 import ipaddress
-import json
 import re
 import ssl
 import time
 from email.header import decode_header
 from urllib.parse import urlparse
-
-import os
-import shutil
 
 
 class ProxyIMAP4SSL(imaplib.IMAP4_SSL):
@@ -30,61 +26,6 @@ class ProxyIMAP4SSL(imaplib.IMAP4_SSL):
         )
 
 
-def _merge_missing_schema_keys(local_value, template_value):
-    if isinstance(local_value, dict) and isinstance(template_value, dict):
-        if all(not isinstance(value, dict) for value in template_value.values()):
-            merged = dict(local_value)
-            for key, value in template_value.items():
-                if key not in merged or merged[key] != value:
-                    merged[key] = value
-            return merged
-        merged = dict(local_value)
-        for key, value in template_value.items():
-            if key in merged:
-                merged[key] = _merge_missing_schema_keys(merged[key], value)
-            else:
-                merged[key] = value
-        return merged
-    return local_value
-
-
-def ensure_schema_file(local_path: str, template_path: str):
-    if not os.path.exists(template_path):
-        return
-    try:
-        with open(template_path, "r", encoding="utf-8") as f:
-            template_data = json.load(f)
-    except Exception as e:
-        logger.warning(f"加载配置模板失败: {e}")
-        return
-    if not os.path.exists(local_path):
-        try:
-            shutil.copy2(template_path, local_path)
-            return
-        except Exception as e:
-            logger.warning(f"复制配置模板失败: {e}")
-            return
-    try:
-        with open(local_path, "r", encoding="utf-8") as f:
-            local_data = json.load(f)
-    except Exception as e:
-        logger.warning(f"读取本地配置 schema 失败: {e}")
-        return
-    merged_data = _merge_missing_schema_keys(local_data, template_data)
-    if merged_data == local_data:
-        return
-    try:
-        with open(local_path, "w", encoding="utf-8") as f:
-            json.dump(merged_data, f, ensure_ascii=False, indent=2)
-            f.write("\n")
-    except Exception as e:
-        logger.warning(f"写回本地配置 schema 失败: {e}")
-
-
-_plugin_dir = os.path.dirname(os.path.abspath(__file__))
-_schema_local = os.path.join(_plugin_dir, "_conf_schema.json")
-_schema_template = os.path.join(_plugin_dir, "_conf_schema.template.json")
-
 try:
     import socks
     HAS_PYSOCKS = True
@@ -94,8 +35,6 @@ except ImportError:
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger, AstrBotConfig
-
-ensure_schema_file(_schema_local, _schema_template)
 
 IMAP_SERVERS = {
     "qq.com": "imap.qq.com",
@@ -158,9 +97,9 @@ class MailAlertPlugin(Star):
     MAX_FILTER_VALUE_LENGTH = 200
     MAX_FILTERS_PER_MAILBOX = 20
 
-    def __init__(self, context: Context, config: AstrBotConfig):
+    def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
-        self.config = config
+        self.config = config or {}
         self._last_check_ts = None
         self._cron_job = None
         self._kv_lock = asyncio.Lock()
