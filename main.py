@@ -11,19 +11,27 @@ from urllib.parse import urlparse
 
 
 class ProxyIMAP4SSL(imaplib.IMAP4_SSL):
-    def __init__(self, host: str, timeout: int | None, proxy_info):
+    def __init__(self, host: str, timeout: int | None, proxy_info, ssl_context=None):
         self.proxy_info = proxy_info
-        super().__init__(host=host, timeout=timeout)
+        # 先设置 ssl_context，因为父类 __init__ 需要它
+        if ssl_context is None:
+            ssl_context = ssl._create_stdlib_context()
+        self.ssl_context = ssl_context
+        # 调用 IMAP4.__init__，它会调用我们的 _create_socket
+        imaplib.IMAP4.__init__(self, host, imaplib.IMAP4_SSL_PORT, timeout)
 
     def _create_socket(self, timeout):
         proxy_type, proxy_host, proxy_port = self.proxy_info
-        return socks.create_connection(
+        # 创建到代理的连接
+        sock = socks.create_connection(
             (self.host, getattr(self, "port", imaplib.IMAP4_SSL_PORT)),
             timeout=timeout,
             proxy_type=proxy_type,
             proxy_addr=proxy_host,
             proxy_port=proxy_port,
         )
+        # 必须用 ssl_context.wrap_socket 包装 socket
+        return self.ssl_context.wrap_socket(sock, server_hostname=self.host)
 
 
 try:
